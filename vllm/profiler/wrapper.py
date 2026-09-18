@@ -213,8 +213,6 @@ class TorchProfilerWrapper(WorkerProfiler):
                 profiler_config.torch_profiler_with_flops,
             )
 
-        # Determine trace handler: use custom handler if provided,
-        # otherwise default to tensorboard trace handler
         if on_trace_ready is not None:
             trace_handler = on_trace_ready
         else:
@@ -244,15 +242,12 @@ class TorchProfilerWrapper(WorkerProfiler):
                     profiler_config.active_iterations,
                 )
 
-        self.profiler = torch.profiler.profile(
-            activities=[TorchProfilerActivityMap[activity] for activity in activities],
-            schedule=profiler_schedule,
-            record_shapes=profiler_config.torch_profiler_record_shapes,
-            profile_memory=profiler_config.torch_profiler_with_memory,
-            with_stack=profiler_config.torch_profiler_with_stack,
-            with_flops=profiler_config.torch_profiler_with_flops,
-            on_trace_ready=trace_handler,
-        )
+        self._activities = [
+            TorchProfilerActivityMap[activity] for activity in activities
+        ]
+        self._profiler_schedule = profiler_schedule
+        self._trace_handler = trace_handler
+        self.profiler = self._create_profiler()
 
         # Track if we're using a schedule (need to call step())
         self._uses_schedule = profiler_schedule is not None
@@ -265,6 +260,19 @@ class TorchProfilerWrapper(WorkerProfiler):
             0,
         )
         self._version_metadata_added = False
+        self._profiler_used = False
+
+    def _create_profiler(self) -> torch.profiler.profile:
+        profiler_config = self.profiler_config
+        return torch.profiler.profile(
+            activities=self._activities,
+            schedule=self._profiler_schedule,
+            record_shapes=profiler_config.torch_profiler_record_shapes,
+            profile_memory=profiler_config.torch_profiler_with_memory,
+            with_stack=profiler_config.torch_profiler_with_stack,
+            with_flops=profiler_config.torch_profiler_with_flops,
+            on_trace_ready=self._trace_handler,
+        )
 
     def _build_profiler_table(
         self,
@@ -319,6 +327,16 @@ class TorchProfilerWrapper(WorkerProfiler):
 
     @override
     def _start(self) -> None:
+        if self._profiler_used:
+            self.profiler = self._create_profiler()
+            self._warmup_steps_remaining = max(
+                self.profiler_config.wait_iterations
+                + self.profiler_config.warmup_iterations
+                - 1,
+                0,
+            )
+            self._version_metadata_added = False
+        self._profiler_used = True
         self.profiler.start()
         # No-schedule case: Kineto is live immediately. With a schedule this
         # no-ops and _profiler_step stamps it once WAIT ends.

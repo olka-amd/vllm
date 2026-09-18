@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, Mock, call, patch
 from uuid import UUID
 
 import pytest
+import torch
 from pydantic import ValidationError
 
 from vllm.config import (
@@ -17,7 +18,11 @@ from vllm.config import (
 )
 from vllm.config.profiler import _is_uri_path
 from vllm.platforms import current_platform
-from vllm.profiler.wrapper import ProtonProfilerWrapper, WorkerProfiler
+from vllm.profiler.wrapper import (
+    ProtonProfilerWrapper,
+    TorchProfilerWrapper,
+    WorkerProfiler,
+)
 from vllm.v1.core.sched.output import CachedRequestData
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.gpu_worker import Worker
@@ -853,6 +858,34 @@ def test_gpu_worker_creates_proton_profiler():
 
     wrapper.assert_called_once_with(worker.profiler_config, worker_name="rank1")
     worker.profiler.start.assert_called_once_with()
+
+
+def test_torch_profiler_can_record_multiple_sessions(tmp_path):
+    traces = []
+    profiler = TorchProfilerWrapper(
+        ProfilerConfig(
+            profiler="torch",
+            torch_profiler_dir=str(tmp_path),
+            torch_profiler_dump_cuda_time_total=False,
+            warmup_iterations=1,
+            active_iterations=1,
+        ),
+        worker_name="rank0",
+        local_rank=0,
+        activities=["CPU"],
+        on_trace_ready=traces.append,
+    )
+
+    for _ in range(2):
+        profiler.start()
+        for _ in range(2):
+            with profiler.annotate_context_manager("work"):
+                torch.ones(1)
+            profiler.step()
+        profiler.stop()
+
+    assert len(traces) == 2
+    assert traces[0] is not traces[1]
 
 
 @_requires_cuda_for_proton

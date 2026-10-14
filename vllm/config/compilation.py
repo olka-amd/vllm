@@ -974,6 +974,16 @@ class CompilationConfig:
             )
 
         if (
+            self.pass_config.fuse_qk_norm_rope_kvcache
+            and "+rotary_embedding" not in self.custom_ops
+        ):
+            # RoPE fusion matches the vllm IR op regardless of custom_ops, but
+            # MRoPE fusion still matches torch.ops.vllm.mrope, which only runs
+            # with the custom op enabled.
+            # TODO: remove once MRoPE is a vllm IR op.
+            self.custom_ops.append("+rotary_embedding")
+
+        if (
             is_torch_equal_or_newer("2.9.0.dev")
             and "combo_kernels" not in self.inductor_compile_config
             and "benchmark_combo_kernel" not in self.inductor_compile_config

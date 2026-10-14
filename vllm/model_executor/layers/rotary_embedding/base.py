@@ -49,9 +49,8 @@ class RotaryEmbeddingBase(CustomOp):
         if not hasattr(self, "use_flashinfer"):
             self.use_flashinfer = False
 
-        self.use_aiter = (
-            self.enabled() and rocm_aiter_ops.is_triton_rotary_embed_enabled()
-        )
+        # Must match the AITER condition in RocmPlatform.get_default_ir_op_priority.
+        self.use_aiter = rocm_aiter_ops.is_triton_rotary_embed_enabled()
 
         if init_cache:
             cache = self._compute_cos_sin_cache()

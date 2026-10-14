@@ -58,12 +58,10 @@ def _set_aiter_rope_env(monkeypatch: pytest.MonkeyPatch, enabled: bool) -> None:
     rocm_aiter_ops.refresh_env_variables()
 
 
-def _expected_rope_provider(custom_op_enabled: bool, aiter_enabled: bool) -> str:
-    if not custom_op_enabled:
-        return "native"
-    if aiter_enabled:
-        return "aiter"
-    return "vllm_c"
+def _expected_rope_provider(aiter_enabled: bool) -> str:
+    # fuse_rope_kvcache implies a RoPE kernel for unfused ranges, with or
+    # without the rotary_embedding custom op.
+    return "aiter" if aiter_enabled else "vllm_c"
 
 
 VLLM_UNIFIED_KV_CACHE_UPDATE_OP = torch.ops.vllm.unified_kv_cache_update
@@ -127,6 +125,7 @@ class QKRoPEKVCacheTestModel(torch.nn.Module):
         dtype: torch.dtype,
         device: torch.device,
         prefix: str = "model.layers.0.self_attn.attn",
+        rope_dtype: torch.dtype | None = None,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -146,7 +145,7 @@ class QKRoPEKVCacheTestModel(torch.nn.Module):
             max_position_embeddings=4096,
             base=10000,
             is_neox_style=is_neox,
-            dtype=self.dtype,
+            dtype=rope_dtype or self.dtype,
         )
 
         # Register layer metadata for the fusion pass via Attention.
@@ -357,9 +356,7 @@ def test_rope_kvcache_fusion(
         vllm.config.set_current_vllm_config(vllm_config),
         vllm_config.kernel_config.ir_op_priority.set_priority(),
     ):
-        expected_provider = _expected_rope_provider(
-            enable_rope_custom_op, enable_aiter_triton_rope
-        )
+        expected_provider = _expected_rope_provider(enable_aiter_triton_rope)
         assert ir.ops.rotary_embedding.get_priority()[0] == expected_provider
 
         model = QKRoPEKVCacheTestModel(
@@ -448,6 +445,87 @@ def test_rope_kvcache_fusion(
         )
 
 
+@pytest.mark.skipif(
+    not is_aiter_found_and_supported(),
+    reason="Only test on ROCm with AITER installed and supported",
+)
+def test_rope_kvcache_fusion_reuses_bf16_cos_sin_cache(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """With an fp32 RoPE cache and the rotary_embedding custom op disabled, the
+    fused op must read the precomputed bf16 cache buffer (#42833) instead of
+    casting the fp32 cache on every forward pass."""
+    dtype = torch.bfloat16
+    num_heads, num_kv_heads, head_size = 64, 8, 64
+    torch.set_default_device("cuda")
+    torch.set_default_dtype(dtype)
+    _set_aiter_rope_env(monkeypatch, True)
+
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(dtype=dtype),
+        cache_config=CacheConfig(block_size=16),
+        compilation_config=CompilationConfig(
+            mode=CompilationMode.VLLM_COMPILE,
+            custom_ops=["none"],
+            pass_config=PassConfig(fuse_rope_kvcache=True, eliminate_noops=True),
+        ),
+    )
+
+    with (
+        vllm.config.set_current_vllm_config(vllm_config),
+        vllm_config.kernel_config.ir_op_priority.set_priority(),
+    ):
+        model = QKRoPEKVCacheTestModel(
+            vllm_config=vllm_config,
+            attn_backend=AttentionBackendEnum.ROCM_AITER_UNIFIED_ATTN,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            is_neox=True,
+            dtype=dtype,
+            device=torch.get_default_device(),
+            rope_dtype=torch.float32,
+        )
+        assert model.rotary_emb.cos_sin_cache.dtype == torch.float32
+        assert model.rotary_emb.cos_sin_cache_bf16 is not None
+
+        fusion_pass = RopeKVCacheFusionPass(vllm_config)
+        backend = TestBackend(
+            NoOpEliminationPass(vllm_config),
+            SplitCoalescingPass(vllm_config),
+            ScatterSplitReplacementPass(vllm_config),
+            fusion_pass,
+            PostCleanupPass(vllm_config),
+            FixFunctionalizationPass(vllm_config),
+        )
+
+        T = 5
+        qkv = torch.randn(T, (num_heads + 2 * num_kv_heads) * head_size, dtype=dtype)
+        pos = torch.arange(T, dtype=torch.long)
+        torch._dynamo.mark_dynamic(qkv, 0)
+        torch._dynamo.mark_dynamic(pos, 0)
+        with set_forward_context(None, vllm_config):
+            model_fused = torch.compile(model, backend=backend)
+            attn_metadata = model_fused.build_attn_metadata(T)
+            get_forward_context().slot_mapping = {
+                model.layer_name: attn_metadata.slot_mapping
+            }
+            model_fused(qkv, pos)
+
+    assert fusion_pass.matched_count == 1
+    (fused_node,) = backend.graph_post_pass.find_nodes(
+        op="call_function",
+        target=torch.ops.vllm.fused_rope_and_unified_kv_cache_update.default,
+    )
+    cache_node = fused_node.kwargs.get("cos_sin_cache", None)
+    if cache_node is None:
+        cache_node = fused_node.args[4]
+    # A graph input or constant means the bf16 buffer is used directly; a cast
+    # node would mean the fp32 cache is converted on every forward pass.
+    assert cache_node.op in ("placeholder", "get_attr"), cache_node.format_node()
+    assert cache_node.meta["val"].dtype == torch.bfloat16
+
+
 @pytest.mark.parametrize(
     "attn_backend",
     [AttentionBackendEnum.ROCM_AITER_UNIFIED_ATTN],
@@ -511,9 +589,7 @@ def test_rope_static_qquant_kvcache_fusion(
         vllm.config.set_current_vllm_config(vllm_config),
         vllm_config.kernel_config.ir_op_priority.set_priority(),
     ):
-        expected_provider = _expected_rope_provider(
-            enable_rope_custom_op, enable_aiter_triton_rope
-        )
+        expected_provider = _expected_rope_provider(enable_aiter_triton_rope)
         assert ir.ops.rotary_embedding.get_priority()[0] == expected_provider
 
         model = QKRoPEStaticQKVCacheTestModel(

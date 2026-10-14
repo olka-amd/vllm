@@ -1254,12 +1254,21 @@ class RocmPlatform(Platform):
         else:
             rms_norm = default
 
-        if not cc.is_custom_op_enabled("rotary_embedding"):
-            rotary_embedding = ["native"]
-        elif rocm_aiter_ops.is_triton_rotary_embed_enabled():
+        # AITER RoPE is opt-in via env, independent of custom_ops. RoPE fusion
+        # flags imply _C, as they used to force +rotary_embedding, so RoPE
+        # outside the fused range keeps a kernel instead of Inductor codegen.
+        pc = cc.pass_config
+        if rocm_aiter_ops.is_triton_rotary_embed_enabled():
             rotary_embedding = ["aiter", "vllm_c", "native"]
-        else:
+        elif (
+            cc.is_custom_op_enabled("rotary_embedding")
+            or pc.enable_qk_norm_rope_fusion
+            or pc.fuse_rope_kvcache
+            or pc.fuse_qk_norm_rope_kvcache
+        ):
             rotary_embedding = ["vllm_c", "native"]
+        else:
+            rotary_embedding = default
 
         return IrOpPriorityConfig.with_default(
             default,

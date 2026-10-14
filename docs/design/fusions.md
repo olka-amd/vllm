@@ -177,10 +177,12 @@ Other attention backends do not support fused output quantization yet.
 **What it fuses.** Fuses the rotary positional embedding kernel with the KV-cache scatter/write into
 a single kernel, avoiding separate reads and writes of the key and value tensors.
 
-Requires: AMD ROCm with AITER enabled, the `rotary_embedding` custom op active (automatic),
-and the `kv_cache` update op visible in the graph: either by using Inductor graph partition
-or removed from `splitting_ops`.
-If these conditions are set, the fusion is enabled automatically for optimization level O1 and above.
+Requires: AMD ROCm with AITER enabled and the `kv_cache` update op visible in the graph: either by
+using Inductor graph partition or removed from `splitting_ops`. The pass matches the vLLM IR
+`rotary_embedding` op, so the `rotary_embedding` custom op does not need to be enabled. RoPE calls
+that are not fused use the IR op priority; set `VLLM_ROCM_USE_AITER_TRITON_ROPE=1` to use AITER for them.
+The fusion is enabled automatically for optimization level O1 and above when these conditions are met
+and the `rotary_embedding` custom op is enabled.
 
 **Code locations.**
 

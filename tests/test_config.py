@@ -4081,13 +4081,16 @@ def test_ir_op_platform_defaults_support_sparse_gelu(mode, backend):
 
 
 @pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm-only priority")
+@pytest.mark.parametrize("aiter_rope", [True, False])
 @pytest.mark.parametrize("custom_ops", [["all"], ["none"]])
-def test_rocm_rotary_priority_honors_custom_ops(custom_ops, monkeypatch):
+def test_rocm_rotary_priority(custom_ops, aiter_rope, monkeypatch):
+    """AITER RoPE is selected by env alone, so fusion-only configs
+    (custom_ops=none) still use AITER for unfused RoPE."""
     from vllm import ir
-    from vllm._aiter_ops import is_aiter_found_and_supported, rocm_aiter_ops
+    from vllm._aiter_ops import rocm_aiter_ops
 
     monkeypatch.setenv("VLLM_ROCM_USE_AITER", "1")
-    monkeypatch.setenv("VLLM_ROCM_USE_AITER_TRITON_ROPE", "1")
+    monkeypatch.setenv("VLLM_ROCM_USE_AITER_TRITON_ROPE", "1" if aiter_rope else "0")
     rocm_aiter_ops.refresh_env_variables()
 
     config = SimpleNamespace(
@@ -4098,12 +4101,12 @@ def test_rocm_rotary_priority_honors_custom_ops(custom_ops, monkeypatch):
         )
     )
     priority = current_platform.get_default_ir_op_priority(config)
-    if custom_ops == ["none"]:
-        expected_provider = "native"
-    elif is_aiter_found_and_supported():
+    if rocm_aiter_ops.is_triton_rotary_embed_enabled():
         expected_provider = "aiter"
-    else:
+    elif custom_ops == ["all"]:
         expected_provider = "vllm_c"
+    else:
+        expected_provider = "native"
     with priority.set_priority():
         assert ir.ops.rotary_embedding.get_priority()[0] == expected_provider
 

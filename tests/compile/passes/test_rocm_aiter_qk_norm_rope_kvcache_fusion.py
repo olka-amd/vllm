@@ -382,12 +382,11 @@ def _run_qk_norm_rope_kvcache_fusion_test(
         monkeypatch.context() as m,
         vllm_config.kernel_config.ir_op_priority.set_priority(),
     ):
-        if custom_op != "+rotary_embedding":
-            expected_provider = "native"
-        elif enable_aiter_triton_rope:
-            expected_provider = "aiter"
-        else:
-            expected_provider = "vllm_c"
+        # fuse_qk_norm_rope_kvcache forces +rotary_embedding for MRoPE fusion.
+        assert "+rotary_embedding" in vllm_config.compilation_config.custom_ops
+        expected_provider = (
+            "aiter" if rocm_aiter_ops.is_triton_rotary_embed_enabled() else "vllm_c"
+        )
         assert ir.ops.rotary_embedding.get_priority()[0] == expected_provider
 
         expected_query_quant_group_shape = None
@@ -647,6 +646,7 @@ def test_qk_norm_rope_kvcache_fusion(
     ],
 )
 @pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
+@pytest.mark.parametrize("custom_op", ["+rotary_embedding", "+rms_norm"])
 @pytest.mark.skipif(
     not IS_AITER_FOUND,
     reason="Requires AITER",
@@ -657,6 +657,7 @@ def test_qk_norm_mrope_kvcache_fusion(
     is_neox: bool,
     kv_layout: KVCacheLayout,
     kv_cache_dtype: CacheDType,
+    custom_op: str,
     monkeypatch: pytest.MonkeyPatch,
 ):
     _run_qk_norm_rope_kvcache_fusion_test(
@@ -674,7 +675,7 @@ def test_qk_norm_mrope_kvcache_fusion(
         dtype=torch.bfloat16,
         kv_cache_dtype=kv_cache_dtype,
         rms_norm_eps=1e-6,
-        custom_op="+rotary_embedding",
+        custom_op=custom_op,
         monkeypatch=monkeypatch,
         mrope_section=mrope_section,
         mrope_interleaved=mrope_interleaved,

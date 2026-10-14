@@ -81,6 +81,7 @@ class MLARoPEKVCacheCatTestModel(torch.nn.Module):
         self.scale = self.qk_head_dim**-0.5
 
         if use_deepseek_scaling_rope:
+            self.rope_op: torch._ops.OpOverload = INDEX_SELECT_OP
             self.rotary_emb = DeepseekScalingRotaryEmbedding(
                 head_size=qk_rope_head_dim,
                 rotary_dim=qk_rope_head_dim,
@@ -91,6 +92,9 @@ class MLARoPEKVCacheCatTestModel(torch.nn.Module):
                 dtype=dtype,
             )
         else:
+            # Base RotaryEmbedding is a vLLM IR op; the fusion matches it
+            # without the rotary_embedding custom op.
+            self.rope_op = torch.ops.vllm_ir.rotary_embedding.default
             self.rotary_emb = RotaryEmbedding(
                 head_size=qk_rope_head_dim,
                 rotary_dim=qk_rope_head_dim,
@@ -211,7 +215,7 @@ class MLARoPEKVCacheCatTestModel(torch.nn.Module):
 
     def ops_in_model_before(self) -> list[torch._ops.OpOverload]:
         ops = [
-            INDEX_SELECT_OP,
+            self.rope_op,
             torch.ops.vllm.unified_mla_kv_cache_update.default,
         ]
         return ops
@@ -228,7 +232,7 @@ if is_aiter_found_and_supported():
 
 
 @pytest.mark.parametrize("attn_backend", MLA_BACKENDS)
-@pytest.mark.parametrize("use_deepseek_scaling_rope", [True])
+@pytest.mark.parametrize("use_deepseek_scaling_rope", [True, False])
 @pytest.mark.parametrize("num_heads", [16])
 @pytest.mark.parametrize("qk_nope_head_dim", [128])
 @pytest.mark.parametrize("qk_rope_head_dim", [64])

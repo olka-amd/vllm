@@ -1020,6 +1020,7 @@ class QkNormRopeKvCacheFusionPass(VllmPatternMatcherPass):
                     layer.head_size,
                 )
                 continue
+            layer.impl.set_interleaved_v_cache()
             shape_key = (
                 layer.num_heads,
                 layer.num_kv_heads,

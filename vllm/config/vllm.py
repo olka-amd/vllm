@@ -1184,6 +1184,32 @@ class VllmConfig:
         # This is the same for all backends
         self.kv_transfer_config.kv_role = "kv_both"
 
+    def _verify_kv_connector_hidden_states(self) -> None:
+        """Reject configurations unsupported by a KV connector that receives
+        hidden states."""
+        if (
+            self.kv_transfer_config is None
+            or not self.kv_transfer_config.is_kv_transfer_instance
+        ):
+            return
+        from vllm.distributed.kv_transfer.kv_connector.factory import (
+            KVConnectorFactory,
+        )
+
+        connector_cls = KVConnectorFactory.get_connector_class(self.kv_transfer_config)
+        if connector_cls.get_required_hidden_states(self) is None:
+            return
+        if not self.use_v2_model_runner:
+            raise ValueError(
+                f"KV connector {connector_cls.__name__} receives hidden states, "
+                "which requires Model Runner V2; set VLLM_USE_V2_MODEL_RUNNER=1."
+            )
+        if self.parallel_config.pipeline_parallel_size > 1:
+            raise ValueError(
+                f"KV connector {connector_cls.__name__} receives hidden states, "
+                "which does not support pipeline parallelism yet."
+            )
+
     def _verify_aux_output_compatibility(self) -> None:
         """Reject configurations unsupported by enabled auxiliary outputs."""
         if not self.aux_output_config.enabled:
@@ -2220,6 +2246,7 @@ class VllmConfig:
         # before the HMA check below, which inspects the connector class.
         self._post_init_kv_transfer_config()
         self._verify_aux_output_compatibility()
+        self._verify_kv_connector_hidden_states()
 
         # Hybrid KV cache manager (HMA) runtime rules:
         # - Explicit enable (--enable-hybrid-kv-cache-manager): error if runtime

@@ -40,6 +40,7 @@ from vllm.distributed.aux_output_connector.worker import (
     AuxOutputWorkerConnector,
     get_aux_output_connector,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.base import StepHiddenStates
 from vllm.distributed.parallel_state import get_dcp_group, get_pp_group
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
@@ -133,6 +134,7 @@ from vllm.v1.worker.gpu.kv_connector import (
     NO_OP_KV_CONNECTOR,
     KVConnector,
     get_kv_connector,
+    get_required_hidden_states,
 )
 from vllm.v1.worker.gpu.lora_utils import (
     LoraState,
@@ -164,6 +166,7 @@ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
 )
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     requires_aux_hidden_states,
+    set_connector_aux_hidden_state_layers,
     set_eagle3_aux_hidden_state_layers,
     verify_supports_aux_hidden_states_over_pp,
 )
@@ -308,6 +311,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.use_aux_hidden_state_outputs = requires_aux_hidden_states(
                 self.speculative_config
             )
+        self.speculator_uses_aux_hidden_states = self.use_aux_hidden_state_outputs
+        # The hidden states the KV connector receives each step, if any.
+        self.connector_hidden_states = get_required_hidden_states(vllm_config)
+        self.connector_hidden_state_layers: tuple[int, ...] = ()
+        if self.connector_hidden_states is not None and (
+            self.connector_hidden_states.layers != ()
+        ):
+            self.use_aux_hidden_state_outputs = True
 
         # Draft tokens propagation - for spec-dec + struct outputs.
         self.draft_tokens_handler = DraftTokensHandler(self.device)
@@ -411,7 +422,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.model, self.vllm_config, self.device
                 )
 
-            if self.use_aux_hidden_state_outputs:
+            if self.speculator_uses_aux_hidden_states:
                 assert self.speculative_config is not None
                 set_eagle3_aux_hidden_state_layers(self.model, self.speculative_config)
                 if self.use_pp:
@@ -421,6 +432,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     )
                     assert self.pp_handler is not None
                     self.pp_handler.configure_aux_hidden_state_relay(self.model)
+            if self.connector_hidden_states is not None:
+                self.connector_hidden_state_layers = (
+                    set_connector_aux_hidden_state_layers(
+                        self.model,
+                        self.connector_hidden_states,
+                        self.speculator_uses_aux_hidden_states,
+                    )
+                )
             if isinstance(self.speculator, DraftModelSpeculator):
                 with use_workspace_lane(self._draft_workspace_lane):
                     self.speculator.load_model(self.model)
@@ -2266,6 +2285,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             check_ep_fault=self.check_ep_fault,
             pending_aux_output=pending_aux_output,
         )
+
+        if self.connector_hidden_states is not None:
+            layers = self.connector_hidden_state_layers
+            self.kv_connector.save_hidden_states(
+                StepHiddenStates(
+                    req_ids=input_batch.req_ids,
+                    query_start_loc=input_batch.query_start_loc_np,
+                    num_tokens=input_batch.num_tokens,
+                    input_ids=input_batch.input_ids,
+                    positions=input_batch.positions,
+                    layers=layers,
+                    aux_hidden_states=list(aux_hidden_states or []) if layers else [],
+                    hidden_states=hidden_states,
+                    sampled_token_ids=sampler_output.sampled_token_ids,
+                    num_sampled=num_sampled,
+                    num_rejected=num_rejected,
+                )
+            )
 
         # Collect KV transfer results now; finalize saves after the drafter runs.
         defer_kv_finalize = self.speculator is not None

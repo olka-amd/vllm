@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.nn as nn
@@ -8,6 +8,9 @@ import torch.nn as nn
 from vllm.config import SpeculativeConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import SupportsEagle3, supports_eagle3
+
+if TYPE_CHECKING:
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import HiddenStatesRequest
 
 logger = init_logger(__name__)
 
@@ -40,6 +43,52 @@ def set_eagle3_aux_hidden_state_layers(
         logger.info("Using Eagle3 auxiliary layers from model: %s", aux_layers)
     eagle3_model.set_aux_hidden_state_layers(aux_layers)
     reserve_aux_intermediate_tensor_slots(model)
+
+
+def get_aux_hidden_state_layers(model: nn.Module) -> tuple[int, ...]:
+    """The auxiliary hidden state layers set on ``model``, in output order."""
+    # The same unwrapping as SupportsEagle3.set_aux_hidden_state_layers.
+    parent: Any = model
+    if hasattr(parent, "get_language_model"):
+        parent = parent.get_language_model()
+    elif hasattr(parent, "language_model"):
+        parent = parent.language_model
+    return tuple(getattr(parent, "model", parent).aux_hidden_state_layers)
+
+
+def set_connector_aux_hidden_state_layers(
+    model: nn.Module,
+    request: "HiddenStatesRequest",
+    speculator_uses_aux_hidden_states: bool,
+) -> tuple[int, ...]:
+    """Set the auxiliary layers a KV connector asks for, and return the layers
+    its ``save_hidden_states`` receives."""
+    if request.layers == ():
+        return ()
+    if speculator_uses_aux_hidden_states:
+        # One model, one set of auxiliary outputs: the drafter's.
+        layers = get_aux_hidden_state_layers(model)
+        if request.layers is not None and tuple(sorted(set(request.layers))) != layers:
+            raise ValueError(
+                f"The KV connector asks for hidden state layers {request.layers}, "
+                f"but the drafter uses {list(layers)}; ask for None to receive "
+                "the drafter's layers."
+            )
+        return layers
+    if not supports_eagle3(model):
+        raise ValueError(
+            f"The KV connector asks for auxiliary hidden states, which "
+            f"{type(model).__name__} cannot output (it does not implement "
+            "SupportsEagle3)."
+        )
+    eagle3_model = cast(SupportsEagle3, model)
+    eagle3_model.set_aux_hidden_state_layers(
+        request.layers
+        if request.layers is not None
+        else eagle3_model.get_eagle3_default_aux_hidden_state_layers()
+    )
+    reserve_aux_intermediate_tensor_slots(model)
+    return get_aux_hidden_state_layers(model)
 
 
 def _inner_decoder(model: nn.Module) -> nn.Module | None:

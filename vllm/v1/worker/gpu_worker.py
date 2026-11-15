@@ -1833,6 +1833,8 @@ class Worker(WorkerBase):
         # Weight transfer bypasses GPUModelRunner.reload_weights().
         if not self._weight_update_is_draft:
             self.model_runner.on_target_weights_replaced()
+        elif hasattr(self.model_runner, "on_draft_weights_replaced"):
+            self.model_runner.on_draft_weights_replaced()
 
     def shutdown(self) -> None:
         gc.unfreeze()

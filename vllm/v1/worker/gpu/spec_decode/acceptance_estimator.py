@@ -466,6 +466,20 @@ class OnlineAcceptanceEstimator:
         self._refit()
         self._refits += 1
 
+    def reset(self) -> None:
+        """Forget the fit: back to the cold-start coefficients, with empty
+        statistics. For new draft weights, whose logits the old fit no longer
+        describes. The fit also learns only from admitted drafts, so one made
+        on a weak drafter, which admits few, can keep admitting few after the
+        drafter improves; a reset lets the next refits start from the prior.
+        In place, so the captured draft graph keeps reading these tensors."""
+        self.slope.fill_(_INIT_SLOPE)
+        self.intercepts.fill_(_INIT_BIAS)
+        self.info.zero_()
+        self.grad.zero_()
+        self.counts.zero_()
+        self._steps_since_refit = 0
+
     def warmup(self) -> None:
         """Drop warmup statistics and compile the refit kernel. A refit on
         zeroed statistics leaves the coefficients unchanged."""

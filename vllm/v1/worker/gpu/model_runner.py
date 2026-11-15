@@ -628,6 +628,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         with use_workspace_lane(self._draft_workspace_lane), single_pp_stage():
             yield
 
+    def on_draft_weights_replaced(self) -> None:
+        # New draft weights: the acceptance estimator's fit was made on the
+        # old ones' logits (adaptive verification), so start it over.
+        estimator = getattr(self.speculator, "acceptance_estimator", None)
+        if estimator is not None and envs.VLLM_RESET_ACCEPTANCE_ESTIMATOR_ON_RELOAD:
+            estimator.reset()
+            logger.info("Draft weights replaced: acceptance estimator reset")
+
     def on_target_weights_replaced(self) -> None:
         # Called whenever the target's weights are replaced (reload, weight
         # transfer), so draft weights derived from them must follow.
@@ -756,7 +764,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             vllm_config=self.vllm_config,
             target_layer_names=target_attn_layer_names,
             additional_attn_cg_support=additional_attn_cg_support,
-            copy_admitted_drafts_to_host=self.batch_sharder is not None,
+            # The hidden-state hook reports each request's rows, which a
+            # binding budget only fixes on the device.
+            copy_admitted_drafts_to_host=self.batch_sharder is not None
+            or self.connector_hidden_states is not None,
         )
 
         self.block_tables = BlockTables(
@@ -2348,10 +2359,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if self.connector_hidden_states is not None:
             layers = self.connector_hidden_state_layers
+            query_start_loc_np = input_batch.query_start_loc_np
+            if input_batch.num_admitted_draft_tokens is not None:
+                # Under adaptive verification a binding draft budget is split
+                # across requests on the device only; the host layout spreads
+                # it evenly. The admitted counts landed early in the step.
+                assert input_batch.num_draft_tokens_per_req is not None
+                num_reqs = input_batch.num_reqs
+                rows = (
+                    input_batch.num_scheduled_tokens[:num_reqs]
+                    - input_batch.num_draft_tokens_per_req[:num_reqs]
+                    + input_batch.num_admitted_draft_tokens.wait()[:num_reqs]
+                )
+                query_start_loc_np = query_start_loc_np.copy()
+                np.cumsum(rows, out=query_start_loc_np[1 : num_reqs + 1])
             self.kv_connector.save_hidden_states(
                 StepHiddenStates(
                     req_ids=input_batch.req_ids,
-                    query_start_loc=input_batch.query_start_loc_np,
+                    query_start_loc=query_start_loc_np,
                     num_tokens=input_batch.num_tokens,
                     input_ids=input_batch.input_ids,
                     positions=input_batch.positions,

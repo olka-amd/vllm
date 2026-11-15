@@ -63,6 +63,7 @@ if TYPE_CHECKING:
     VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: int = 512
     VLLM_SPARSE_INDEXER_MAX_DECODE_LOGITS_MB: int = 2048
     VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN: int = 8192
+    VLLM_RESET_ACCEPTANCE_ESTIMATOR_ON_RELOAD: bool = True
     VLLM_XPU_PP_MICROBATCH: bool = True
     VLLM_DISTRIBUTED_USE_SPLIT_GROUP: bool = False
     VLLM_XLA_USE_SPMD: bool = False
@@ -1170,6 +1171,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Clamped to max_model_len - query_len. Default: 8192 tokens
     "VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN": lambda: int(
         os.getenv("VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN", "8192")
+    ),
+    # Restart adaptive verification's acceptance estimator from its prior
+    # whenever the draft weights are replaced in place (weight transfer).
+    "VLLM_RESET_ACCEPTANCE_ESTIMATOR_ON_RELOAD": lambda: bool(
+        int(os.getenv("VLLM_RESET_ACCEPTANCE_ESTIMATOR_ON_RELOAD", "1"))
     ),
     # If set, the OpenAI API server will stay alive even after the underlying
     # AsyncLLMEngine errors and stops serving requests

@@ -488,3 +488,48 @@ def test_warmup_covers_every_batch_size_and_the_refit():
 
     assert estimator._refits == 1
     assert compiled_variants() == warmed
+
+
+def test_reset_returns_to_the_prior_in_place():
+    """New draft weights restart the fit (hot reload): the cold-start
+    coefficients, empty statistics, and the same tensors, which the captured
+    draft graph keeps reading."""
+    from vllm.v1.worker.gpu.spec_decode.acceptance_estimator import (
+        _INIT_BIAS,
+        _INIT_SLOPE,
+    )
+
+    device = current_platform.device_type
+    torch.manual_seed(0)
+    estimator = OnlineAcceptanceEstimator(REFIT_NUM_REQS, NUM_STEPS, device)
+    estimator.REFIT_INTERVAL = 5
+    slots = torch.arange(REFIT_NUM_REQS, device=device, dtype=torch.int32)
+    # A weak drafter: everything rejected. Only the first draft of each round
+    # is graded (verification stops there), so position 0 alone learns, and
+    # its intercept falls far enough to keep the deeper ones from being tried.
+    for _ in range(20):
+        features = torch.rand(REFIT_NUM_REQS, NUM_STEPS, device=device) * 8.0
+        num_accepted = torch.zeros(REFIT_NUM_REQS, device=device)
+        _drive_round(estimator, features, num_accepted, slots)
+    assert estimator.intercepts[0].item() < _INIT_BIAS - 1.0
+    tensors = [
+        estimator.slope,
+        estimator.intercepts,
+        estimator.info,
+        estimator.grad,
+        estimator.counts,
+    ]
+    pointers = [t.data_ptr() for t in tensors]
+
+    estimator.reset()
+
+    assert [t.data_ptr() for t in tensors] == pointers
+    torch.testing.assert_close(
+        estimator.slope, torch.full_like(estimator.slope, _INIT_SLOPE)
+    )
+    torch.testing.assert_close(
+        estimator.intercepts, torch.full_like(estimator.intercepts, _INIT_BIAS)
+    )
+    for t in (estimator.info, estimator.grad, estimator.counts):
+        assert not t.any()
+    assert estimator._steps_since_refit == 0
